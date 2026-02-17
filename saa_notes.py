@@ -124,11 +124,12 @@ Respond with ONLY the bullet points, no explanation."""
 
 
 class StudyNotesSession:
-    def __init__(self, source, keep_raw=True, lesson=None, title=None):
+    def __init__(self, source, keep_raw=True, lesson=None, title=None, silence_timeout=0):
         self.source = source
         self.keep_raw = keep_raw
         self.lesson = lesson
         self.title = title
+        self.silence_timeout = silence_timeout
         self.all_transcription = []
         self.current_buffer = []
         self.buffer_start_time = None
@@ -215,7 +216,7 @@ class StudyNotesSession:
         self.org_file.write(f"** Notes ~{time_str}\n")
         self.org_file.write(text + "\n\n")
         self.org_file.flush()
-        print(f"\n[📝 Live notes written at {time_str}]", file=sys.stderr)
+        print(f"\n[Live notes written at {time_str}]", file=sys.stderr)
 
     def write_final_summary(self):
         full_text = " ".join(self.all_transcription)
@@ -227,13 +228,13 @@ class StudyNotesSession:
         heading = "* Final Summary (continued)" if self.appending else "* Final Summary"
 
         if len(words) <= MAX_SUMMARY_WORDS:
-            print("\n[🔄 Generating final structured notes...]", file=sys.stderr)
+            print("\n[Generating final structured notes...]", file=sys.stderr)
             summary = summarize_with_ollama(full_text, is_final=True)
             if summary:
                 self.org_file.write(f"\n{heading}\n\n")
                 self.org_file.write(summary + "\n")
                 self.org_file.flush()
-                print(f"[✅ Final notes saved to {self.org_path}]", file=sys.stderr)
+                print(f"[Final notes saved to {self.org_path}]", file=sys.stderr)
         else:
             # Text too long, chunk it
             num_chunks = (len(words) + MAX_SUMMARY_WORDS - 1) // MAX_SUMMARY_WORDS
@@ -249,7 +250,7 @@ class StudyNotesSession:
                     self.org_file.write(f"** Part {i+1}\n\n")
                     self.org_file.write(summary + "\n\n")
                     self.org_file.flush()
-            print(f"[✅ Final notes saved to {self.org_path}]", file=sys.stderr)
+            print(f"[Final notes saved to {self.org_path}]", file=sys.stderr)
 
     def process_buffer(self):
         if not self.current_buffer:
@@ -263,6 +264,76 @@ class StudyNotesSession:
         summary = summarize_with_ollama(text)
         self.write_live_summary(summary)
 
+
+    def consolidate_notes(self):
+        """Read back the org file, send notes to Ollama to deduplicate/clean, rewrite."""
+        try:
+            content = self.org_path.read_text()
+        except OSError:
+            return
+
+        # Split header from body — header ends at first blank line after metadata
+        lines = content.split("\n")
+        body_start = 0
+        for i, line in enumerate(lines):
+            if line.startswith("* ") or (line.startswith("** ") and i > 0):
+                body_start = i
+                break
+        if body_start == 0:
+            return
+
+        header = "\n".join(lines[:body_start])
+        body = "\n".join(lines[body_start:])
+
+        if len(body.split()) < 30:
+            return
+
+        print("[Consolidating notes (removing repetition)...]", file=sys.stderr)
+
+        prompt = f"""You are editing org-mode study notes for the AWS Solutions Architect Associate (SAA) exam.
+
+These notes were generated incrementally during a lecture and contain significant repetition.
+Consolidate them into a single clean set of notes.
+
+Rules:
+- Merge duplicate points — keep the most detailed/accurate version
+- Preserve ALL unique technical facts, service details, limits, and gotchas
+- Use org-mode headings (* for topics, ** for subtopics)
+- Use concise bullet points (- ) for key facts
+- Remove redundant section headers like "Notes ~HH:MM", "Final Summary", "Part N"
+- Do NOT add information that isn't in the original notes
+- Be concise but don't lose technical details
+
+Notes to consolidate:
+{body}
+
+Respond with ONLY the cleaned org-mode content, no explanation."""
+
+        try:
+            response = requests.post(OLLAMA_URL, json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.2}
+            }, timeout=180)
+            try:
+                cleaned = response.json().get("response", "").strip()
+            except (ValueError, requests.exceptions.JSONDecodeError):
+                print("[Consolidation failed: non-JSON response]", file=sys.stderr)
+                return
+        except Exception as e:
+            print(f"[Consolidation failed: {e}]", file=sys.stderr)
+            return
+
+        if not cleaned or len(cleaned.split()) < 10:
+            print("[Consolidation returned too little content, keeping original]", file=sys.stderr)
+            return
+
+        try:
+            self.org_path.write_text(header + "\n" + cleaned + "\n")
+            print("[Notes consolidated successfully]", file=sys.stderr)
+        except OSError as e:
+            print(f"Error: cannot write consolidated notes: {e}", file=sys.stderr)
 
     def update_index(self):
         if not self.lesson or not self.note_id or self.appending:
@@ -342,10 +413,14 @@ class StudyNotesSession:
         samples_per_chunk = SAMPLE_RATE * CHUNK_SECONDS
         last_summary_time = time.time()
 
-        print(f"🎧 Listening on {self.source}", file=sys.stderr)
-        print(f"📄 Writing to {self.org_path}", file=sys.stderr)
+        print(f"Listening on {self.source}", file=sys.stderr)
+        print(f"Writing to {self.org_path}", file=sys.stderr)
         print(f"   Live summaries every ~{SUMMARY_INTERVAL}s", file=sys.stderr)
+        if self.silence_timeout:
+            print(f"   Auto-stop after {self.silence_timeout}s of silence", file=sys.stderr)
         print(f"   Press Ctrl+C to stop and generate final notes\n", file=sys.stderr)
+
+        last_speech_time = time.time()
 
         try:
             while True:
@@ -359,7 +434,14 @@ class StudyNotesSession:
                 audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
                 if np.abs(audio).mean() < SILENCE_THRESHOLD:
+                    if self.silence_timeout and self.all_transcription:
+                        elapsed = time.time() - last_speech_time
+                        if elapsed >= self.silence_timeout:
+                            print(f"\n[{self.silence_timeout}s of silence, auto-stopping]", file=sys.stderr)
+                            break
                     continue
+
+                last_speech_time = time.time()
 
                 segments, _ = model.transcribe(audio, language="en")
                 for seg in segments:
@@ -413,6 +495,9 @@ class StudyNotesSession:
 
             self.org_file.close()
 
+            # Consolidate notes (deduplicate across live summaries + final summary)
+            self.consolidate_notes()
+
             # Update org-roam index if lesson/title provided
             self.update_index()
 
@@ -430,6 +515,8 @@ def main():
                         help="Seconds between live summaries (default: 120)")
     parser.add_argument("--no-raw", action="store_true",
                         help="Don't keep the raw transcription .txt file")
+    parser.add_argument("--timeout", type=int, default=0,
+                        help="Auto-stop after N seconds of silence (default: disabled)")
     parser.add_argument("--lesson", help="Course section in index (e.g. 'IAM, Accounts and AWS Organizations')")
     parser.add_argument("--title", help="Title for the org-roam note (e.g. 'When to use IAM Roles')")
     args = parser.parse_args()
@@ -454,7 +541,8 @@ def main():
         sys.exit(1)
 
     session = StudyNotesSession(source, keep_raw=not args.no_raw,
-                                lesson=args.lesson, title=args.title)
+                                lesson=args.lesson, title=args.title,
+                                silence_timeout=args.timeout)
     session.run()
 
 
