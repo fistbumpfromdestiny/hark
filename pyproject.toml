@@ -1,0 +1,16 @@
+[project]
+name = "hark"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy",
+  "faster-whisper",
+  "requests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
